@@ -1,4 +1,4 @@
-// src/Game.js — бомба перетаскивается, взрыв при клике без движения
+// src/Game.js
 
 import { ChipDragHandler } from './ChipDragHandler.js';
 
@@ -30,15 +30,18 @@ function playSound(type) {
 }
 
 export class Game {
-  constructor(board, renderer) {
+  constructor(board, renderer, scoreManager, levelManager) {
     this.board = board;
     this.renderer = renderer;
+    this.scoreManager = scoreManager;
+    this.levelManager = levelManager;
     this.canvas = renderer.canvas;
     this.dragHandler = null;
     this.disappearingChips = [];
     this.fallingChips = [];
     this.isAnimating = false;
     this.bombExploding = false;
+    this.potentialBombClick = null;
 
     this.canvas.addEventListener('pointerdown', (e) => this.onPointerDown(e));
     this.canvas.addEventListener('pointermove', (e) => this.onPointerMove(e));
@@ -66,7 +69,6 @@ export class Game {
     const type = this.board.get(cell.x, cell.y);
     if (type === -1) return;
 
-    // Запоминаем начальную клетку для бомбы
     this.potentialBombClick = { x: cell.x, y: cell.y, type };
 
     this.renderer.setDraggingChip({ x: cell.x, y: cell.y });
@@ -106,9 +108,7 @@ export class Game {
         this.triggerBombExplosion(bombX, bombY);
       }
     } else {
-      // Не было обмена — проверяем, это был клик по бомбе?
       if (type === 6 && this.potentialBombClick) {
-        // Клик без движения → взрыв
         this.triggerBombExplosion(origX, origY);
       }
     }
@@ -116,18 +116,21 @@ export class Game {
     this.renderer.clearDraggingChip();
     this.dragHandler.release();
     this.dragHandler = null;
-    this.potentialBombClick = null;
 
-    if (madeSwap && !swappedWithBomb) {
+    if (madeSwap) {
+      this.levelManager.useMove();
+
       const matchInfo = this.findMatchesWithSize();
       if (matchInfo.matches.length > 0) {
         this.startDisappearanceAnimation(matchInfo);
-      } else {
+      } else if (!swappedWithBomb) {
         const currentOrig = this.board.get(origX, origY);
         this.board.grid[origY][origX] = type;
         this.board.grid[targetCell.y][targetCell.x] = currentOrig;
       }
     }
+
+    this.potentialBombClick = null;
   }
 
   triggerBombExplosion(x, y) {
@@ -136,17 +139,24 @@ export class Game {
     playSound('explosion');
 
     const toRemove = [];
+    let blueCount = 0;
     for (let dy = -1; dy <= 1; dy++) {
       for (let dx = -1; dx <= 1; dx++) {
         const nx = x + dx;
         const ny = y + dy;
         if (nx >= 0 && nx < this.board.width && ny >= 0 && ny < this.board.height) {
           if (this.board.grid[ny][nx] !== -1) {
+            if (this.board.grid[ny][nx] === 5) blueCount++;
             toRemove.push({ x: nx, y: ny, type: this.board.grid[ny][nx] });
             this.board.grid[ny][nx] = -1;
           }
         }
       }
+    }
+
+    this.levelManager.addBlueDestroyed(blueCount);
+    if (toRemove.length > 0) {
+      this.scoreManager.addPoints(toRemove.length * 15);
     }
 
     this.disappearingChips = toRemove.map(chip => ({
@@ -235,20 +245,38 @@ export class Game {
     this.isAnimating = true;
     this.disappearingChips = [];
 
+    let totalRemoved = 0;
+    let blueCount = 0;
+
     for (const { x, y, size } of matchInfo.matches) {
       if (size === 'bomb') {
         this.board.grid[y][x] = 6;
       } else {
+        const removedType = this.board.grid[y][x];
+        if (removedType === 5) blueCount++;
         this.disappearingChips.push({
           x,
           y,
-          type: this.board.grid[y][x],
+          type: removedType,
           progress: 0,
           phase: 'flash',
           size
         });
         this.board.grid[y][x] = -1;
+        totalRemoved++;
       }
+    }
+
+    this.levelManager.addBlueDestroyed(blueCount);
+
+    if (totalRemoved > 0) {
+      let bonus = 0;
+      for (const { size } of matchInfo.matches) {
+        if (typeof size === 'number' && size > 3) {
+          bonus += (size - 3) * 20;
+        }
+      }
+      this.scoreManager.addPoints(totalRemoved * 10 + bonus);
     }
 
     this.animateDisappearance();
@@ -337,12 +365,30 @@ export class Game {
     if (this.fallingChips.length === 0) {
       this.renderer.setFallingChips([]);
       this.isAnimating = false;
-      setTimeout(() => {
-        const matchInfo = this.findMatchesWithSize();
-        if (matchInfo.matches.length > 0) {
-          this.startDisappearanceAnimation(matchInfo);
-        }
-      }, 100);
+
+      // Проверка завершения уровня
+      if (this.levelManager.isLevelComplete()) {
+        setTimeout(() => {
+          if (this.levelManager.nextLevel()) {
+            alert('Поздравляем! Вы прошли все уровни!');
+          } else {
+            this.board.initialize();
+          }
+        }, 500);
+      } else if (this.levelManager.isGameOver()) {
+        setTimeout(() => {
+          alert('Ходы закончились! Попробуйте снова.');
+          this.levelManager.reset();
+          this.board.initialize();
+        }, 500);
+      } else {
+        setTimeout(() => {
+          const matchInfo = this.findMatchesWithSize();
+          if (matchInfo.matches.length > 0) {
+            this.startDisappearanceAnimation(matchInfo);
+          }
+        }, 100);
+      }
       return;
     }
 
@@ -359,12 +405,29 @@ export class Game {
       this.fallingChips = [];
       this.renderer.setFallingChips([]);
       this.isAnimating = false;
-      setTimeout(() => {
-        const matchInfo = this.findMatchesWithSize();
-        if (matchInfo.matches.length > 0) {
-          this.startDisappearanceAnimation(matchInfo);
-        }
-      }, 100);
+
+      if (this.levelManager.isLevelComplete()) {
+        setTimeout(() => {
+          if (this.levelManager.nextLevel()) {
+            alert('Поздравляем! Вы прошли все уровни!');
+          } else {
+            this.board.initialize();
+          }
+        }, 500);
+      } else if (this.levelManager.isGameOver()) {
+        setTimeout(() => {
+          alert('Ходы закончились! Попробуйте снова.');
+          this.levelManager.reset();
+          this.board.initialize();
+        }, 500);
+      } else {
+        setTimeout(() => {
+          const matchInfo = this.findMatchesWithSize();
+          if (matchInfo.matches.length > 0) {
+            this.startDisappearanceAnimation(matchInfo);
+          }
+        }, 100);
+      }
     } else {
       requestAnimationFrame(() => this.animateFalling());
     }
